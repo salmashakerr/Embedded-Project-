@@ -1,0 +1,6 @@
+## System Architecture
+The system is divided into three hardware-software modules as seen in the schematic:
+
+1. Sensing Layer: 5-Channel IR Array (J5) detects line positions and sends signals S1-S5 to the Arduino.
+2. Control Layer: Arduino Mega 2560 (J1-J3) processes inputs and calculates PWM speed (ENA/ENB) and direction (IN1-IN4).
+3. Drive Layer: L298N Motor Driver (J4/J6) uses external battery power (J7) to drive the DC Motors (N1/M2).
