@@ -1,4 +1,3 @@
-##Code:
 #include <EEPROM.h>
 
 // ========== PIN DEFINITIONS ==========
@@ -28,12 +27,12 @@ const int SPEED       = 55;
 const int TURN_SPEED  = 80;
 
 // ========== INTERSECTION TIMING ==========
-const int NUDGE_MS     = 180;
-const int TURN_BLIND_MS = 250;
-const int UTURN_BLIND_MS = 600;
+const int NUDGE_MS       = 180;
+const int TURN_BLIND_MS  = 250;
+const int UTURN_BLIND_MS = 500;
 
 // ========== EEPROM ==========
-const byte MAGIC = 0xA5;
+const byte MAGIC   = 0xA5;
 const int MAX_PATH = 200;
 
 // ========== END DOT ==========
@@ -41,11 +40,11 @@ const int END_DOT_MS = 300;
 const int DOT_CREEP  = 30;
 
 // ========== STATE ==========
-enum Mode { IDLE, TRAINING, SOLVING, DONE };
+enum Mode { IDLE, TRAINING, SOLVING, DONE, MANUAL };
 Mode mode = IDLE;
 
 char path[MAX_PATH];
-int pathLen = 0;
+int pathLen    = 0;
 int solveIndex = 0;
 
 bool armed = false;
@@ -96,7 +95,6 @@ void flushESP() {
   while (Serial1.available()) Serial.write(Serial1.read());
 }
 
-// Only call when motors are stopped
 void sendWiFi(String msg) {
   if (!wifiReady) return;
   Serial1.print("AT+CIPSEND=0,");
@@ -143,22 +141,24 @@ void checkCommands() {
 
 void handleCommand(String cmd) {
   cmd.toUpperCase();
+
+  // ---- MISSION COMMANDS ----
   if (cmd == "TRAIN") {
-    mode = TRAINING;
-    pathLen = 0;
+    mode       = TRAINING;
+    pathLen    = 0;
     solveIndex = 0;
-    armed = false;
+    armed      = false;
     lastLineTime = millis();
     Serial.println("STATE:TRAINING");
     sendWiFi("STATE:TRAINING");
   }
   else if (cmd == "SOLVE") {
     if (EEPROM.read(0) == MAGIC) {
-      mode = SOLVING;
+      mode    = SOLVING;
       pathLen = EEPROM.read(1);
       for (int i = 0; i < pathLen; i++) path[i] = (char)EEPROM.read(2 + i);
       solveIndex = 0;
-      armed = false;
+      armed      = false;
       lastLineTime = millis();
 
       String p = "SHORTEST_PATH:";
@@ -174,10 +174,11 @@ void handleCommand(String cmd) {
   }
   else if (cmd == "STATUS") {
     String s = "STATE:";
-    if (mode == IDLE) s += "IDLE";
+    if (mode == IDLE)          s += "IDLE";
     else if (mode == TRAINING) s += "TRAINING";
-    else if (mode == SOLVING) s += "SOLVING";
-    else s += "DONE";
+    else if (mode == SOLVING)  s += "SOLVING";
+    else if (mode == MANUAL)   s += "MANUAL";
+    else                       s += "DONE";
     Serial.println(s);
     sendWiFi(s);
     if (EEPROM.read(0) == MAGIC) {
@@ -196,11 +197,49 @@ void handleCommand(String cmd) {
   }
   else if (cmd == "RESET") {
     EEPROM.write(0, 0x00);
-    mode = IDLE;
+    mode    = IDLE;
     pathLen = 0;
+    stopMotors();
     Serial.println("EEPROM_CLEARED");
     sendWiFi("EEPROM_CLEARED");
     sendWiFi("STATE:IDLE");
+  }
+
+  // ---- MANUAL CONTROL COMMANDS ----
+  else if (cmd == "FWD") {
+    if (mode == IDLE || mode == DONE || mode == MANUAL) {
+      mode = MANUAL;
+      moveForward();
+    }
+  }
+  else if (cmd == "MLEFT") {
+    if (mode == IDLE || mode == DONE || mode == MANUAL) {
+      mode = MANUAL;
+      rotateLeft();
+    }
+  }
+  else if (cmd == "MRIGHT") {
+    if (mode == IDLE || mode == DONE || mode == MANUAL) {
+      mode = MANUAL;
+      rotateRight();
+    }
+  }
+  else if (cmd == "MBACK") {
+    if (mode == IDLE || mode == DONE || mode == MANUAL) {
+      mode = MANUAL;
+      digitalWrite(IN1, HIGH);
+      digitalWrite(IN2, LOW);
+      analogWrite(ENA, SPEED);
+      digitalWrite(IN3, HIGH);
+      digitalWrite(IN4, LOW);
+      analogWrite(ENB, SPEED);
+    }
+  }
+  else if (cmd == "MSTOP") {
+    if (mode == MANUAL) {
+      stopMotors();
+      mode = IDLE;
+    }
   }
 }
 
@@ -210,13 +249,13 @@ void creepForward() {
   digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH); analogWrite(ENB, DOT_CREEP);
 }
 
-// ========== CHECK END DOT (used in two places) ==========
+// ========== CHECK END DOT ==========
 bool checkEndDot() {
   unsigned long dotStart = millis();
   while (millis() - dotStart < END_DOT_MS) {
     creepForward();
-    if (digitalRead(FAR_LEFT) != ON_LINE || digitalRead(LEFT) != ON_LINE ||
-        digitalRead(CENTER) != ON_LINE || digitalRead(RIGHT) != ON_LINE ||
+    if (digitalRead(FAR_LEFT)  != ON_LINE || digitalRead(LEFT)   != ON_LINE ||
+        digitalRead(CENTER)    != ON_LINE || digitalRead(RIGHT)   != ON_LINE ||
         digitalRead(FAR_RIGHT) != ON_LINE) {
       return false;
     }
@@ -228,12 +267,8 @@ bool checkEndDot() {
 void setup() {
   Serial.begin(9600);
 
-  pinMode(ENA, OUTPUT);
-  pinMode(IN1, OUTPUT);
-  pinMode(IN2, OUTPUT);
-  pinMode(ENB, OUTPUT);
-  pinMode(IN3, OUTPUT);
-  pinMode(IN4, OUTPUT);
+  pinMode(ENA, OUTPUT); pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(ENB, OUTPUT); pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
 
   pinMode(FAR_LEFT,  INPUT);
   pinMode(LEFT,      INPUT);
@@ -246,7 +281,7 @@ void setup() {
 
   lastLineTime = millis();
   sendWiFi("STATE:IDLE");
-  sendWiFi("COMMANDS: TRAIN SOLVE STATUS STOP RESET");
+  sendWiFi("COMMANDS: TRAIN SOLVE STATUS STOP RESET FWD MLEFT MRIGHT MBACK MSTOP");
 
   delay(2000);
 }
@@ -257,6 +292,10 @@ void loop() {
   if (millis() - lastCmdCheck > 100) {
     checkCommands();
     lastCmdCheck = millis();
+  }
+
+  if (mode == MANUAL) {
+    return;
   }
 
   if (mode != TRAINING && mode != SOLVING) {
@@ -270,12 +309,12 @@ void loop() {
   int r  = digitalRead(RIGHT);
   int fr = digitalRead(FAR_RIGHT);
 
-  bool allOn = (fl == ON_LINE && l == ON_LINE && c == ON_LINE &&
-                r == ON_LINE && fr == ON_LINE);
+  bool allOn   = (fl == ON_LINE && l == ON_LINE && c == ON_LINE &&
+                  r  == ON_LINE && fr == ON_LINE);
   bool anyLine = (fl == ON_LINE || l == ON_LINE || c == ON_LINE ||
-                  r == ON_LINE || fr == ON_LINE);
+                  r  == ON_LINE || fr == ON_LINE);
 
-  if (!allOn) armed = true;
+  if (!allOn)  armed = true;
   if (anyLine) lastLineTime = millis();
 
   // ---- END DOT DETECTION ----
@@ -284,6 +323,7 @@ void loop() {
   }
 
   // ---- INTERSECTION DETECTED ----
+  // From doc 20: no center check, so it catches all intersections reliably
   if (armed && (fl == ON_LINE || fr == ON_LINE)) {
     handleIntersection();
     return;
@@ -342,9 +382,8 @@ void handleIntersection() {
   int fr = digitalRead(FAR_RIGHT);
 
   if (fl == ON_LINE && l == ON_LINE && c == ON_LINE &&
-      r == ON_LINE && fr == ON_LINE) {
+      r  == ON_LINE && fr == ON_LINE) {
     if (checkEndDot()) { finishMaze(); return; }
-    // Re-read after failed dot check
     c = digitalRead(CENTER);
     l = digitalRead(LEFT);
     r = digitalRead(RIGHT);
@@ -368,7 +407,6 @@ void handleIntersection() {
     else if (straightBranch) d = 'S';
     else if (rightBranch)    d = 'R';
     else                     d = 'B';
-
     recordMove(d);
   } else {
     // SOLVING: follow saved path
@@ -420,17 +458,12 @@ void recordMove(char d) {
 
 void simplifyTail() {
   while (pathLen >= 3 && path[pathLen - 2] == 'B') {
-    char a = path[pathLen - 3];
-    char c = path[pathLen - 1];
+    char a   = path[pathLen - 3];
+    char c   = path[pathLen - 1];
     char rep = 0;
 
-    if      (a == 'L' && c == 'L') rep = 'S';
-    else if (a == 'L' && c == 'R') rep = 'B';
-    else if (a == 'L' && c == 'S') rep = 'R';
-    else if (a == 'S' && c == 'L') rep = 'R';
-    else if (a == 'S' && c == 'R') rep = 'L';
-    else if (a == 'S' && c == 'S') rep = 'B';
-    else if (a == 'R' && c == 'L') rep = 'B';
+    if      (a == 'L' && c == 'L') rep = 'S';   // LBL -> S (dead end between two lefts)
+    else if (a == 'R' && c == 'R') rep = 'S';   // RBR -> S (dead end between two rights)
     else break;
 
     pathLen -= 3;
@@ -468,20 +501,17 @@ void finishMaze() {
     Serial.println("=============================");
     Serial.println("=== MAZE SOLVED ===");
     Serial.println("=============================");
-
     sendWiFi("MAZE_SOLVED");
     sendWiFi("STATE:DONE");
   }
   mode = DONE;
 }
 
-// ========== CLOSED-LOOP TURNS (rotate until line found) ==========
+// ========== CLOSED-LOOP TURNS ==========
 void turnLeftToLine() {
   rotateLeft();
   delay(TURN_BLIND_MS);
-  while (digitalRead(CENTER) != ON_LINE) {
-    // keep rotating until center sensor re-acquires the line
-  }
+  while (digitalRead(CENTER) != ON_LINE) {}
   stopMotors();
   delay(50);
 }
@@ -489,9 +519,7 @@ void turnLeftToLine() {
 void turnRightToLine() {
   rotateRight();
   delay(TURN_BLIND_MS);
-  while (digitalRead(CENTER) != ON_LINE) {
-    // keep rotating
-  }
+  while (digitalRead(CENTER) != ON_LINE) {}
   stopMotors();
   delay(50);
 }
@@ -499,71 +527,38 @@ void turnRightToLine() {
 void uTurnToLine() {
   rotateRight();
   delay(UTURN_BLIND_MS);
-  while (digitalRead(CENTER) != ON_LINE) {
-    // keep rotating until line found on the other side
-  }
+  while (digitalRead(CENTER) != ON_LINE) {}
   stopMotors();
   delay(50);
 }
 
 // ========== MOTOR PRIMITIVES ==========
 void moveForward() {
-  digitalWrite(IN1, LOW);
-  digitalWrite(IN2, HIGH);
-  analogWrite(ENA, SPEED);
-
-  digitalWrite(IN3, LOW);
-  digitalWrite(IN4, HIGH);
-  analogWrite(ENB, SPEED);
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH); analogWrite(ENA, SPEED);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH); analogWrite(ENB, SPEED);
 }
 
 void gentleLeft() {
-  digitalWrite(IN1, LOW);
-  digitalWrite(IN2, HIGH);
-  analogWrite(ENA, SPEED / 3);
-
-  digitalWrite(IN3, LOW);
-  digitalWrite(IN4, HIGH);
-  analogWrite(ENB, SPEED);
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH); analogWrite(ENA, SPEED / 3);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH); analogWrite(ENB, SPEED);
 }
 
 void gentleRight() {
-  digitalWrite(IN1, LOW);
-  digitalWrite(IN2, HIGH);
-  analogWrite(ENA, SPEED);
-
-  digitalWrite(IN3, LOW);
-  digitalWrite(IN4, HIGH);
-  analogWrite(ENB, SPEED / 3);
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH); analogWrite(ENA, SPEED);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH); analogWrite(ENB, SPEED / 3);
 }
 
 void rotateLeft() {
-  digitalWrite(IN1, HIGH);
-  digitalWrite(IN2, LOW);
-  analogWrite(ENA, TURN_SPEED);
-
-  digitalWrite(IN3, LOW);
-  digitalWrite(IN4, HIGH);
-  analogWrite(ENB, TURN_SPEED);
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);  analogWrite(ENA, TURN_SPEED);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH); analogWrite(ENB, TURN_SPEED);
 }
 
 void rotateRight() {
-  digitalWrite(IN1, LOW);
-  digitalWrite(IN2, HIGH);
-  analogWrite(ENA, TURN_SPEED);
-
-  digitalWrite(IN3, HIGH);
-  digitalWrite(IN4, LOW);
-  analogWrite(ENB, TURN_SPEED);
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH); analogWrite(ENA, TURN_SPEED);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);  analogWrite(ENB, TURN_SPEED);
 }
 
 void stopMotors() {
-  digitalWrite(IN1, LOW);
-  digitalWrite(IN2, LOW);
-  analogWrite(ENA, 0);
-
-  digitalWrite(IN3, LOW);
-  digitalWrite(IN4, LOW);
-  analogWrite(ENB, 0);
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW); analogWrite(ENA, 0);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW); analogWrite(ENB, 0);
 }
-
