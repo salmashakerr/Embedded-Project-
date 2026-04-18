@@ -1,2 +1,569 @@
 ##Code:
+#include <EEPROM.h>
+
+// ========== PIN DEFINITIONS ==========
+// Left motors (Channel A)
+const int ENA = 9;
+const int IN1 = 7;
+const int IN2 = 6;
+
+// Right motors (Channel B)
+const int ENB = 8;
+const int IN3 = 5;
+const int IN4 = 4;
+
+// ========== IR SENSOR PINS ==========
+const int FAR_LEFT  = 24;
+const int LEFT      = 26;
+const int CENTER    = 28;
+const int RIGHT     = 30;
+const int FAR_RIGHT = 32;
+
+// ========== SENSOR POLARITY ==========
+#define ON_LINE   LOW
+#define OFF_LINE  HIGH
+
+// ========== SPEED ==========
+const int SPEED       = 55;
+const int TURN_SPEED  = 80;
+
+// ========== INTERSECTION TIMING ==========
+const int NUDGE_MS     = 180;
+const int TURN_BLIND_MS = 250;
+const int UTURN_BLIND_MS = 600;
+
+// ========== EEPROM ==========
+const byte MAGIC = 0xA5;
+const int MAX_PATH = 200;
+
+// ========== END DOT ==========
+const int END_DOT_MS = 300;
+const int DOT_CREEP  = 30;
+
+// ========== STATE ==========
+enum Mode { IDLE, TRAINING, SOLVING, DONE };
+Mode mode = IDLE;
+
+char path[MAX_PATH];
+int pathLen = 0;
+int solveIndex = 0;
+
+bool armed = false;
+unsigned long lastLineTime = 0;
+
+// ========== WiFi ==========
+bool wifiReady = false;
+String inputBuffer = "";
+
+// ========== WiFi SETUP ==========
+void setupWiFi() {
+  Serial1.begin(9600);
+  delay(1000);
+
+  Serial1.println("AT+RST");
+  delay(3000);
+  flushESP();
+
+  Serial1.println("AT");
+  delay(1000);
+  flushESP();
+
+  Serial1.println("AT+CWMODE=2");
+  delay(1000);
+  flushESP();
+
+  Serial1.println("AT+CWSAP=\"MazeRobot\",\"12345678\",5,3");
+  delay(2000);
+  flushESP();
+
+  Serial1.println("AT+CIPMUX=1");
+  delay(1000);
+  flushESP();
+
+  Serial1.println("AT+CIPSERVER=1,333");
+  delay(1000);
+  flushESP();
+
+  Serial1.println("AT+CIFSR");
+  delay(1000);
+  flushESP();
+
+  wifiReady = true;
+  Serial.println("WiFi ready: MazeRobot / 12345678 / port 333");
+}
+
+void flushESP() {
+  while (Serial1.available()) Serial.write(Serial1.read());
+}
+
+// Only call when motors are stopped
+void sendWiFi(String msg) {
+  if (!wifiReady) return;
+  Serial1.print("AT+CIPSEND=0,");
+  Serial1.println(msg.length() + 2);
+  delay(20);
+  Serial1.println(msg);
+  delay(20);
+  flushESP();
+}
+
+// ========== CHECK COMMANDS ==========
+void checkCommands() {
+  while (Serial1.available()) {
+    char c = Serial1.read();
+    if (c == '\n' || c == '\r') {
+      inputBuffer.trim();
+      int ipdIndex = inputBuffer.indexOf("+IPD,");
+      if (ipdIndex >= 0) {
+        int colonIndex = inputBuffer.indexOf(':', ipdIndex);
+        if (colonIndex >= 0) {
+          String cmd = inputBuffer.substring(colonIndex + 1);
+          cmd.trim();
+          handleCommand(cmd);
+        }
+      }
+      inputBuffer = "";
+    } else {
+      inputBuffer += c;
+    }
+  }
+
+  static String usbBuffer = "";
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      usbBuffer.trim();
+      if (usbBuffer.length() > 0) handleCommand(usbBuffer);
+      usbBuffer = "";
+    } else {
+      usbBuffer += c;
+    }
+  }
+}
+
+void handleCommand(String cmd) {
+  cmd.toUpperCase();
+  if (cmd == "TRAIN") {
+    mode = TRAINING;
+    pathLen = 0;
+    solveIndex = 0;
+    armed = false;
+    lastLineTime = millis();
+    Serial.println("STATE:TRAINING");
+    sendWiFi("STATE:TRAINING");
+  }
+  else if (cmd == "SOLVE") {
+    if (EEPROM.read(0) == MAGIC) {
+      mode = SOLVING;
+      pathLen = EEPROM.read(1);
+      for (int i = 0; i < pathLen; i++) path[i] = (char)EEPROM.read(2 + i);
+      solveIndex = 0;
+      armed = false;
+      lastLineTime = millis();
+
+      String p = "SHORTEST_PATH:";
+      for (int i = 0; i < pathLen; i++) p += path[i];
+      Serial.println(p);
+      sendWiFi(p);
+      Serial.println("STATE:SOLVING");
+      sendWiFi("STATE:SOLVING");
+    } else {
+      Serial.println("ERROR:NO_SAVED_PATH");
+      sendWiFi("ERROR:NO_SAVED_PATH");
+    }
+  }
+  else if (cmd == "STATUS") {
+    String s = "STATE:";
+    if (mode == IDLE) s += "IDLE";
+    else if (mode == TRAINING) s += "TRAINING";
+    else if (mode == SOLVING) s += "SOLVING";
+    else s += "DONE";
+    Serial.println(s);
+    sendWiFi(s);
+    if (EEPROM.read(0) == MAGIC) {
+      int len = EEPROM.read(1);
+      String p = "SAVED_PATH:";
+      for (int i = 0; i < len; i++) p += (char)EEPROM.read(2 + i);
+      Serial.println(p);
+      sendWiFi(p);
+    }
+  }
+  else if (cmd == "STOP") {
+    mode = DONE;
+    stopMotors();
+    Serial.println("STATE:STOPPED");
+    sendWiFi("STATE:STOPPED");
+  }
+  else if (cmd == "RESET") {
+    EEPROM.write(0, 0x00);
+    mode = IDLE;
+    pathLen = 0;
+    Serial.println("EEPROM_CLEARED");
+    sendWiFi("EEPROM_CLEARED");
+    sendWiFi("STATE:IDLE");
+  }
+}
+
+// ========== SLOW CREEP FOR DOT CHECK ==========
+void creepForward() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH); analogWrite(ENA, DOT_CREEP);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH); analogWrite(ENB, DOT_CREEP);
+}
+
+// ========== CHECK END DOT (used in two places) ==========
+bool checkEndDot() {
+  unsigned long dotStart = millis();
+  while (millis() - dotStart < END_DOT_MS) {
+    creepForward();
+    if (digitalRead(FAR_LEFT) != ON_LINE || digitalRead(LEFT) != ON_LINE ||
+        digitalRead(CENTER) != ON_LINE || digitalRead(RIGHT) != ON_LINE ||
+        digitalRead(FAR_RIGHT) != ON_LINE) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// ========== SETUP ==========
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(ENA, OUTPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(ENB, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+
+  pinMode(FAR_LEFT,  INPUT);
+  pinMode(LEFT,      INPUT);
+  pinMode(CENTER,    INPUT);
+  pinMode(RIGHT,     INPUT);
+  pinMode(FAR_RIGHT, INPUT);
+
+  Serial.println("Initializing WiFi...");
+  setupWiFi();
+
+  lastLineTime = millis();
+  sendWiFi("STATE:IDLE");
+  sendWiFi("COMMANDS: TRAIN SOLVE STATUS STOP RESET");
+
+  delay(2000);
+}
+
+// ========== MAIN LOOP ==========
+void loop() {
+  static unsigned long lastCmdCheck = 0;
+  if (millis() - lastCmdCheck > 100) {
+    checkCommands();
+    lastCmdCheck = millis();
+  }
+
+  if (mode != TRAINING && mode != SOLVING) {
+    stopMotors();
+    return;
+  }
+
+  int fl = digitalRead(FAR_LEFT);
+  int l  = digitalRead(LEFT);
+  int c  = digitalRead(CENTER);
+  int r  = digitalRead(RIGHT);
+  int fr = digitalRead(FAR_RIGHT);
+
+  bool allOn = (fl == ON_LINE && l == ON_LINE && c == ON_LINE &&
+                r == ON_LINE && fr == ON_LINE);
+  bool anyLine = (fl == ON_LINE || l == ON_LINE || c == ON_LINE ||
+                  r == ON_LINE || fr == ON_LINE);
+
+  if (!allOn) armed = true;
+  if (anyLine) lastLineTime = millis();
+
+  // ---- END DOT DETECTION ----
+  if (armed && allOn) {
+    if (checkEndDot()) { finishMaze(); return; }
+  }
+
+  // ---- INTERSECTION DETECTED ----
+  if (armed && (fl == ON_LINE || fr == ON_LINE)) {
+    handleIntersection();
+    return;
+  }
+
+  // ---- DEAD END ----
+  if (!anyLine && (millis() - lastLineTime > 300)) {
+    Serial.println("DEAD END -> U-turn");
+    if (mode == TRAINING) recordMove('B');
+    uTurnToLine();
+    lastLineTime = millis();
+    return;
+  }
+
+  // ---- NORMAL LINE FOLLOWING ----
+  lineFollow(l, c, r);
+}
+
+// ========== LINE FOLLOWING (inner 3 sensors) ==========
+void lineFollow(int l, int c, int r) {
+  if (c == ON_LINE && l == OFF_LINE && r == OFF_LINE) {
+    moveForward();
+  }
+  else if (l == ON_LINE && r == OFF_LINE) {
+    gentleLeft();
+  }
+  else if (r == ON_LINE && l == OFF_LINE) {
+    gentleRight();
+  }
+  else {
+    moveForward();
+  }
+}
+
+// ========== INTERSECTION HANDLER ==========
+void handleIntersection() {
+  bool leftBranch  = false;
+  bool rightBranch = false;
+
+  // Stage 1: drive through the crossbar, sampling far sensors
+  unsigned long startTime = millis();
+  while (millis() - startTime < NUDGE_MS) {
+    moveForward();
+    if (digitalRead(FAR_LEFT)  == ON_LINE) leftBranch  = true;
+    if (digitalRead(FAR_RIGHT) == ON_LINE) rightBranch = true;
+  }
+
+  stopMotors();
+  delay(80);
+
+  // Check for end dot after nudge
+  int fl = digitalRead(FAR_LEFT);
+  int l  = digitalRead(LEFT);
+  int c  = digitalRead(CENTER);
+  int r  = digitalRead(RIGHT);
+  int fr = digitalRead(FAR_RIGHT);
+
+  if (fl == ON_LINE && l == ON_LINE && c == ON_LINE &&
+      r == ON_LINE && fr == ON_LINE) {
+    if (checkEndDot()) { finishMaze(); return; }
+    // Re-read after failed dot check
+    c = digitalRead(CENTER);
+    l = digitalRead(LEFT);
+    r = digitalRead(RIGHT);
+  }
+
+  // Stage 2: check if straight path exists
+  bool straightBranch = (c == ON_LINE || l == ON_LINE || r == ON_LINE);
+
+  Serial.print("Intersection -> L=");
+  Serial.print(leftBranch);
+  Serial.print(" S=");
+  Serial.print(straightBranch);
+  Serial.print(" R=");
+  Serial.println(rightBranch);
+
+  // Stage 3: decide direction
+  char d;
+  if (mode == TRAINING) {
+    // LSRB priority
+    if (leftBranch)          d = 'L';
+    else if (straightBranch) d = 'S';
+    else if (rightBranch)    d = 'R';
+    else                     d = 'B';
+
+    recordMove(d);
+  } else {
+    // SOLVING: follow saved path
+    if (solveIndex >= pathLen) {
+      Serial.println("Path exhausted");
+      sendWiFi("PATH_EXHAUSTED");
+      mode = DONE;
+      return;
+    }
+    d = path[solveIndex++];
+    Serial.print("Exec ");
+    Serial.print(solveIndex);
+    Serial.print("/");
+    Serial.print(pathLen);
+    Serial.print(": ");
+    Serial.println(d);
+  }
+
+  // Stage 4: execute the move
+  if (d == 'L') {
+    Serial.println("Decision: LEFT");
+    turnLeftToLine();
+  }
+  else if (d == 'S') {
+    Serial.println("Decision: STRAIGHT");
+  }
+  else if (d == 'R') {
+    Serial.println("Decision: RIGHT");
+    turnRightToLine();
+  }
+  else {
+    Serial.println("Decision: U-TURN");
+    uTurnToLine();
+  }
+
+  lastLineTime = millis();
+}
+
+// ========== PATH RECORDING + SIMPLIFICATION ==========
+void recordMove(char d) {
+  if (pathLen >= MAX_PATH) return;
+  path[pathLen++] = d;
+  simplifyTail();
+
+  Serial.print("Path: ");
+  for (int i = 0; i < pathLen; i++) Serial.print(path[i]);
+  Serial.println();
+}
+
+void simplifyTail() {
+  while (pathLen >= 3 && path[pathLen - 2] == 'B') {
+    char a = path[pathLen - 3];
+    char c = path[pathLen - 1];
+    char rep = 0;
+
+    if      (a == 'L' && c == 'L') rep = 'S';
+    else if (a == 'L' && c == 'R') rep = 'B';
+    else if (a == 'L' && c == 'S') rep = 'R';
+    else if (a == 'S' && c == 'L') rep = 'R';
+    else if (a == 'S' && c == 'R') rep = 'L';
+    else if (a == 'S' && c == 'S') rep = 'B';
+    else if (a == 'R' && c == 'L') rep = 'B';
+    else break;
+
+    pathLen -= 3;
+    path[pathLen++] = rep;
+
+    Serial.print("Simplified: ");
+    Serial.print(a); Serial.print("B"); Serial.print(c);
+    Serial.print(" -> "); Serial.println(rep);
+  }
+}
+
+// ========== FINISH ==========
+void finishMaze() {
+  stopMotors();
+  if (mode == TRAINING) {
+    EEPROM.write(0, MAGIC);
+    EEPROM.write(1, (byte)pathLen);
+    for (int i = 0; i < pathLen; i++) EEPROM.write(2 + i, (byte)path[i]);
+
+    Serial.println("=============================");
+    Serial.println("=== TRAINING COMPLETE ===");
+    Serial.print("Optimized path (");
+    Serial.print(pathLen);
+    Serial.print(" moves): ");
+    for (int i = 0; i < pathLen; i++) Serial.print(path[i]);
+    Serial.println();
+    Serial.println("Place robot on start, type SOLVE");
+    Serial.println("=============================");
+
+    String p = "TRAINING_COMPLETE:";
+    for (int i = 0; i < pathLen; i++) p += path[i];
+    sendWiFi(p);
+    sendWiFi("STATE:DONE");
+  } else {
+    Serial.println("=============================");
+    Serial.println("=== MAZE SOLVED ===");
+    Serial.println("=============================");
+
+    sendWiFi("MAZE_SOLVED");
+    sendWiFi("STATE:DONE");
+  }
+  mode = DONE;
+}
+
+// ========== CLOSED-LOOP TURNS (rotate until line found) ==========
+void turnLeftToLine() {
+  rotateLeft();
+  delay(TURN_BLIND_MS);
+  while (digitalRead(CENTER) != ON_LINE) {
+    // keep rotating until center sensor re-acquires the line
+  }
+  stopMotors();
+  delay(50);
+}
+
+void turnRightToLine() {
+  rotateRight();
+  delay(TURN_BLIND_MS);
+  while (digitalRead(CENTER) != ON_LINE) {
+    // keep rotating
+  }
+  stopMotors();
+  delay(50);
+}
+
+void uTurnToLine() {
+  rotateRight();
+  delay(UTURN_BLIND_MS);
+  while (digitalRead(CENTER) != ON_LINE) {
+    // keep rotating until line found on the other side
+  }
+  stopMotors();
+  delay(50);
+}
+
+// ========== MOTOR PRIMITIVES ==========
+void moveForward() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  analogWrite(ENA, SPEED);
+
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+  analogWrite(ENB, SPEED);
+}
+
+void gentleLeft() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  analogWrite(ENA, SPEED / 3);
+
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+  analogWrite(ENB, SPEED);
+}
+
+void gentleRight() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  analogWrite(ENA, SPEED);
+
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+  analogWrite(ENB, SPEED / 3);
+}
+
+void rotateLeft() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  analogWrite(ENA, TURN_SPEED);
+
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+  analogWrite(ENB, TURN_SPEED);
+}
+
+void rotateRight() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  analogWrite(ENA, TURN_SPEED);
+
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+  analogWrite(ENB, TURN_SPEED);
+}
+
+void stopMotors() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  analogWrite(ENA, 0);
+
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+  analogWrite(ENB, 0);
+}
 
