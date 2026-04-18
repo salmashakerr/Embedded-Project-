@@ -1,84 +1,690 @@
-## Python Script Code:
 import socket
 import threading
 import time
-import sys
+import json
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
 
-ESP_IP = "192.168.4.1"
-ESP_PORT = 333
+# ========== ROBOT CONNECTION ==========
+robot_socket = None
+connected = False
+messages = []
+msg_lock = threading.Lock()
 
-def receive_loop(sock):
-    """Continuously receive and print messages from the robot."""
-    buffer = ""
-    while True:
+def connect_robot(ip, port):
+    global robot_socket, connected
+    try:
+        robot_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        robot_socket.settimeout(5)
+        robot_socket.connect((ip, int(port)))
+        robot_socket.settimeout(None)
+        connected = True
+        add_message("SYSTEM", "Connected to robot!")
+        t = threading.Thread(target=receive_loop, daemon=True)
+        t.start()
+        return True
+    except Exception as e:
+        add_message("SYSTEM", f"Connection failed: {e}")
+        connected = False
+        return False
+
+def disconnect_robot():
+    global robot_socket, connected
+    if robot_socket:
         try:
-            data = sock.recv(1024).decode("utf-8", errors="replace")
+            robot_socket.close()
+        except:
+            pass
+    robot_socket = None
+    connected = False
+    add_message("SYSTEM", "Disconnected")
+
+def send_command(cmd):
+    global robot_socket, connected
+    if not connected or not robot_socket:
+        add_message("SYSTEM", "Not connected!")
+        return False
+    try:
+        robot_socket.send((cmd + "\r\n").encode())
+        add_message("YOU", cmd)
+        return True
+    except Exception as e:
+        add_message("SYSTEM", f"Send failed: {e}")
+        connected = False
+        return False
+
+def receive_loop():
+    global connected
+    buffer = ""
+    while connected:
+        try:
+            data = robot_socket.recv(1024).decode("utf-8", errors="replace")
             if not data:
-                print("\n[Disconnected from robot]")
+                add_message("SYSTEM", "Connection closed by robot")
+                connected = False
                 break
             buffer += data
             while "\n" in buffer:
                 line, buffer = buffer.split("\n", 1)
                 line = line.strip()
-                if line:
-                    # Filter out AT command garbage
-                    if line.startswith("AT+") or line == "OK" or line == ">" or line.startswith("SEND") or line.startswith("Recv"):
-                        continue
-                    print(f"  ROBOT > {line}")
+                if line and not is_at_garbage(line):
+                    add_message("ROBOT", line)
         except Exception as e:
-            print(f"\n[Connection lost: {e}]")
+            if connected:
+                add_message("SYSTEM", f"Connection lost: {e}")
+                connected = False
             break
 
-def main():
-    print("=" * 50)
-    print("       MAZE ROBOT CONTROLLER")
-    print("=" * 50)
-    print()
-    print("Make sure you are connected to WiFi: MazeRobot")
-    print("Password: 12345678")
-    print()
-    print(f"Connecting to {ESP_IP}:{ESP_PORT}...")
+def is_at_garbage(line):
+    garbage = ["AT+", "OK", ">", "SEND OK", "Recv", "busy", "link is not", "CLOSED", "CONNECT"]
+    for g in garbage:
+        if line.startswith(g):
+            return True
+    return False
 
+def add_message(source, text):
+    with msg_lock:
+        messages.append({
+            "source": source,
+            "text": text,
+            "time": time.strftime("%H:%M:%S")
+        })
+        if len(messages) > 200:
+            messages.pop(0)
+
+# ========== HTML PAGE ==========
+HTML_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Maze Robot Controller</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'Outfit', sans-serif;
+    background: #0a0a0f;
+    color: #e0e0e8;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  .bg-grid {
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background-image:
+      linear-gradient(rgba(255,255,255,0.02) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,0.02) 1px, transparent 1px);
+    background-size: 40px 40px;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .container {
+    position: relative;
+    z-index: 1;
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 30px 20px;
+  }
+
+  header {
+    text-align: center;
+    margin-bottom: 30px;
+  }
+
+  header h1 {
+    font-family: 'Outfit', sans-serif;
+    font-weight: 800;
+    font-size: 2.4em;
+    background: linear-gradient(135deg, #00f0ff, #7b5cff, #ff3cac);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    letter-spacing: -1px;
+  }
+
+  header p {
+    color: #666;
+    font-size: 0.95em;
+    margin-top: 5px;
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+  }
+
+  .panel {
+    background: #12121a;
+    border: 1px solid #1e1e2e;
+    border-radius: 16px;
+    padding: 24px;
+  }
+
+  .panel h2 {
+    font-size: 0.8em;
+    text-transform: uppercase;
+    letter-spacing: 3px;
+    color: #555;
+    margin-bottom: 16px;
+    font-weight: 600;
+  }
+
+  .conn-row {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+  }
+
+  .conn-row input {
+    flex: 1;
+    background: #0a0a12;
+    border: 1px solid #2a2a3a;
+    border-radius: 10px;
+    padding: 12px 14px;
+    color: #e0e0e8;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.9em;
+    outline: none;
+    transition: border 0.3s;
+  }
+
+  .conn-row input:focus {
+    border-color: #7b5cff;
+  }
+
+  .conn-row input::placeholder {
+    color: #444;
+  }
+
+  .status-dot {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: #ff3333;
+    box-shadow: 0 0 8px #ff333366;
+    transition: all 0.3s;
+  }
+
+  .status-dot.on {
+    background: #00ff88;
+    box-shadow: 0 0 8px #00ff8866;
+  }
+
+  .btn {
+    font-family: 'Outfit', sans-serif;
+    font-weight: 600;
+    font-size: 0.85em;
+    padding: 12px 20px;
+    border: none;
+    border-radius: 10px;
+    cursor: pointer;
+    transition: all 0.2s;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+
+  .btn:active { transform: scale(0.96); }
+
+  .btn-connect {
+    background: linear-gradient(135deg, #00f0ff, #007bff);
+    color: #000;
+  }
+
+  .btn-disconnect {
+    background: linear-gradient(135deg, #ff3333, #cc0000);
+    color: #fff;
+  }
+
+  .btn-train {
+    background: linear-gradient(135deg, #7b5cff, #5533cc);
+    color: #fff;
+  }
+
+  .btn-solve {
+    background: linear-gradient(135deg, #00ff88, #00cc66);
+    color: #000;
+  }
+
+  .btn-stop {
+    background: linear-gradient(135deg, #ff3cac, #cc0066);
+    color: #fff;
+  }
+
+  .btn-reset {
+    background: linear-gradient(135deg, #ff8800, #cc6600);
+    color: #fff;
+  }
+
+  .btn-status {
+    background: linear-gradient(135deg, #444, #333);
+    color: #ddd;
+  }
+
+  .btn-manual {
+    background: #1a1a2e;
+    border: 1px solid #2a2a3a;
+    color: #ccc;
+    width: 70px;
+    height: 70px;
+    font-size: 1.4em;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 14px;
+  }
+
+  .btn-manual:hover {
+    border-color: #7b5cff;
+    background: #1e1e32;
+    color: #fff;
+  }
+
+  .btn-manual-stop {
+    background: #2a1a1a;
+    border: 1px solid #3a2222;
+    color: #ff5555;
+  }
+
+  .btn-manual-stop:hover {
+    border-color: #ff3333;
+    background: #331a1a;
+  }
+
+  .mission-btns {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+  }
+
+  .mission-btns .btn {
+    width: 100%;
+  }
+
+  .dpad {
+    display: grid;
+    grid-template-columns: 70px 70px 70px;
+    grid-template-rows: 70px 70px 70px;
+    gap: 8px;
+    justify-content: center;
+    align-items: center;
+  }
+
+  .dpad-up    { grid-column: 2; grid-row: 1; }
+  .dpad-left  { grid-column: 1; grid-row: 2; }
+  .dpad-stop  { grid-column: 2; grid-row: 2; }
+  .dpad-right { grid-column: 3; grid-row: 2; }
+  .dpad-down  { grid-column: 2; grid-row: 3; }
+
+  .log-panel {
+    grid-column: 1 / -1;
+  }
+
+  .log-area {
+    background: #08080e;
+    border: 1px solid #1a1a28;
+    border-radius: 12px;
+    padding: 16px;
+    height: 320px;
+    overflow-y: auto;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.82em;
+    line-height: 1.7;
+  }
+
+  .log-area::-webkit-scrollbar { width: 6px; }
+  .log-area::-webkit-scrollbar-track { background: transparent; }
+  .log-area::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+
+  .log-line { display: flex; gap: 10px; }
+  .log-time { color: #444; min-width: 65px; }
+  .log-src-robot { color: #00f0ff; min-width: 55px; }
+  .log-src-you { color: #7b5cff; min-width: 55px; }
+  .log-src-system { color: #ff8800; min-width: 55px; }
+  .log-text { color: #bbb; word-break: break-all; }
+
+  .log-line .log-text.highlight {
+    color: #00ff88;
+    font-weight: 600;
+  }
+
+  .path-panel {
+    grid-column: 1 / -1;
+  }
+
+  .path-display {
+    background: #08080e;
+    border: 1px solid #1a1a28;
+    border-radius: 12px;
+    padding: 20px;
+    text-align: center;
+    min-height: 60px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .path-label {
+    font-size: 0.75em;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    color: #555;
+  }
+
+  .path-moves {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 1.6em;
+    font-weight: 700;
+    letter-spacing: 6px;
+    color: #7b5cff;
+    word-break: break-all;
+  }
+
+  .path-moves.solved {
+    color: #00ff88;
+  }
+
+  .path-moves.running {
+    color: #ff8800;
+  }
+
+  @media (max-width: 700px) {
+    .grid { grid-template-columns: 1fr; }
+    .log-panel, .path-panel { grid-column: 1; }
+  }
+</style>
+</head>
+<body>
+<div class="bg-grid"></div>
+<div class="container">
+  <header>
+    <h1>MAZE ROBOT</h1>
+    <p>// wireless control interface</p>
+  </header>
+
+  <div class="grid">
+    <div class="panel">
+      <h2>Connection</h2>
+      <div class="conn-row">
+        <div class="status-dot" id="statusDot"></div>
+        <input type="text" id="ipInput" value="192.168.4.1" placeholder="IP Address">
+        <input type="text" id="portInput" value="333" placeholder="Port" style="max-width:80px">
+        <button class="btn btn-connect" id="connBtn" onclick="toggleConnect()">Connect</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Mission Control</h2>
+      <div class="mission-btns">
+        <button class="btn btn-train" onclick="sendCmd('TRAIN')">Train</button>
+        <button class="btn btn-solve" onclick="sendCmd('SOLVE')">Solve</button>
+        <button class="btn btn-stop" onclick="sendCmd('STOP')">Stop</button>
+        <button class="btn btn-reset" onclick="sendCmd('RESET')">Reset</button>
+        <button class="btn btn-status" onclick="sendCmd('STATUS')" style="grid-column:1/-1">Status</button>
+      </div>
+    </div>
+
+    <div class="panel" style="grid-column: 1/-1">
+      <h2>Manual Control</h2>
+      <div class="dpad">
+        <button class="btn btn-manual dpad-up" onmousedown="sendCmd('FWD')" onmouseup="sendCmd('MSTOP')" ontouchstart="sendCmd('FWD')" ontouchend="sendCmd('MSTOP')">&#9650;</button>
+        <button class="btn btn-manual dpad-left" onmousedown="sendCmd('MLEFT')" onmouseup="sendCmd('MSTOP')" ontouchstart="sendCmd('MLEFT')" ontouchend="sendCmd('MSTOP')">&#9664;</button>
+        <button class="btn btn-manual btn-manual-stop dpad-stop" onclick="sendCmd('MSTOP')">&#9632;</button>
+        <button class="btn btn-manual dpad-right" onmousedown="sendCmd('MRIGHT')" onmouseup="sendCmd('MSTOP')" ontouchstart="sendCmd('MRIGHT')" ontouchend="sendCmd('MSTOP')">&#9654;</button>
+        <button class="btn btn-manual dpad-down" onmousedown="sendCmd('MBACK')" onmouseup="sendCmd('MSTOP')" ontouchstart="sendCmd('MBACK')" ontouchend="sendCmd('MSTOP')">&#9660;</button>
+      </div>
+    </div>
+
+    <div class="panel path-panel">
+      <h2>Path</h2>
+      <div class="path-display">
+        <div>
+          <div class="path-label">Training Path</div>
+          <div class="path-moves" id="trainPath">--</div>
+        </div>
+        <div>
+          <div class="path-label">Shortest Path</div>
+          <div class="path-moves solved" id="solvePath">--</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel log-panel">
+      <h2>Live Log</h2>
+      <div class="log-area" id="logArea"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+let isConnected = false;
+let lastMsgCount = 0;
+let pollInterval = null;
+
+function toggleConnect() {
+  if (isConnected) {
+    fetch('/disconnect').then(r => r.json()).then(d => {
+      isConnected = false;
+      updateConnUI();
+    });
+  } else {
+    const ip = document.getElementById('ipInput').value;
+    const port = document.getElementById('portInput').value;
+    fetch('/connect?ip=' + ip + '&port=' + port)
+      .then(r => r.json())
+      .then(d => {
+        isConnected = d.ok;
+        updateConnUI();
+        if (isConnected && !pollInterval) {
+          pollInterval = setInterval(pollMessages, 300);
+        }
+      });
+  }
+}
+
+function updateConnUI() {
+  const dot = document.getElementById('statusDot');
+  const btn = document.getElementById('connBtn');
+  if (isConnected) {
+    dot.classList.add('on');
+    btn.textContent = 'Disconnect';
+    btn.className = 'btn btn-disconnect';
+  } else {
+    dot.classList.remove('on');
+    btn.textContent = 'Connect';
+    btn.className = 'btn btn-connect';
+  }
+}
+
+function sendCmd(cmd) {
+  fetch('/send?cmd=' + encodeURIComponent(cmd))
+    .then(r => r.json());
+}
+
+function pollMessages() {
+  fetch('/messages?after=' + lastMsgCount)
+    .then(r => r.json())
+    .then(data => {
+      isConnected = data.connected;
+      updateConnUI();
+
+      if (data.msgs.length > 0) {
+        const log = document.getElementById('logArea');
+        data.msgs.forEach(m => {
+          const div = document.createElement('div');
+          div.className = 'log-line';
+
+          const timeSpan = document.createElement('span');
+          timeSpan.className = 'log-time';
+          timeSpan.textContent = m.time;
+
+          const srcSpan = document.createElement('span');
+          srcSpan.className = 'log-src-' + m.source.toLowerCase();
+          srcSpan.textContent = m.source;
+
+          const textSpan = document.createElement('span');
+          textSpan.className = 'log-text';
+          textSpan.textContent = m.text;
+
+          if (m.text.includes('TRAINING_COMPLETE') ||
+              m.text.includes('MAZE_SOLVED') ||
+              m.text.includes('SHORTEST_PATH')) {
+            textSpan.classList.add('highlight');
+          }
+
+          // Update path displays
+          if (m.text.startsWith('TRAINING_COMPLETE:')) {
+            const trainEl = document.getElementById('trainPath');
+            trainEl.textContent = m.text.split(':')[1];
+            trainEl.className = 'path-moves';
+          }
+          if (m.text.startsWith('SHORTEST_PATH:')) {
+            document.getElementById('solvePath').textContent = m.text.split(':')[1];
+          }
+          if (m.text.startsWith('SAVED_PATH:')) {
+            document.getElementById('solvePath').textContent = m.text.split(':')[1];
+          }
+
+          // Clear path displays on reset
+          if (m.text.includes('EEPROM_CLEARED')) {
+            document.getElementById('trainPath').textContent = '--';
+            document.getElementById('trainPath').className = 'path-moves';
+            document.getElementById('solvePath').textContent = '--';
+            document.getElementById('solvePath').className = 'path-moves solved';
+          }
+
+          // Show running state on new training
+          if (m.text.includes('STATE:TRAINING')) {
+            const trainEl = document.getElementById('trainPath');
+            trainEl.textContent = 'Running...';
+            trainEl.className = 'path-moves running';
+            document.getElementById('solvePath').textContent = '--';
+            document.getElementById('solvePath').className = 'path-moves solved';
+          }
+
+          // Show running state on solve
+          if (m.text.includes('STATE:SOLVING')) {
+            const solveEl = document.getElementById('solvePath');
+            solveEl.className = 'path-moves running';
+          }
+
+          // Restore solved color when done
+          if (m.text.includes('MAZE_SOLVED')) {
+            const solveEl = document.getElementById('solvePath');
+            solveEl.className = 'path-moves solved';
+          }
+
+          div.appendChild(timeSpan);
+          div.appendChild(srcSpan);
+          div.appendChild(textSpan);
+          log.appendChild(div);
+        });
+        log.scrollTop = log.scrollHeight;
+        lastMsgCount = data.total;
+      }
+    });
+}
+
+pollInterval = setInterval(pollMessages, 300);
+
+document.addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'INPUT') return;
+  switch(e.key) {
+    case 'ArrowUp': case 'w': sendCmd('FWD'); break;
+    case 'ArrowLeft': case 'a': sendCmd('MLEFT'); break;
+    case 'ArrowRight': case 'd': sendCmd('MRIGHT'); break;
+    case 'ArrowDown': case 's': sendCmd('MBACK'); break;
+    case ' ': sendCmd('MSTOP'); e.preventDefault(); break;
+  }
+});
+
+document.addEventListener('keyup', (e) => {
+  if (e.target.tagName === 'INPUT') return;
+  if (['ArrowUp','ArrowLeft','ArrowRight','ArrowDown','w','a','s','d'].includes(e.key)) {
+    sendCmd('MSTOP');
+  }
+});
+</script>
+</body>
+</html>
+"""
+
+# ========== HTTP SERVER ==========
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        params = parse_qs(parsed.query)
+
+        if path == '/':
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(HTML_PAGE.encode())
+
+        elif path == '/connect':
+            ip = params.get('ip', ['192.168.4.1'])[0]
+            port = params.get('port', ['333'])[0]
+            ok = connect_robot(ip, int(port))
+            self.json_response({'ok': ok})
+
+        elif path == '/disconnect':
+            disconnect_robot()
+            self.json_response({'ok': True})
+
+        elif path == '/send':
+            cmd = params.get('cmd', [''])[0]
+            ok = send_command(cmd)
+            self.json_response({'ok': ok})
+
+        elif path == '/messages':
+            after = int(params.get('after', ['0'])[0])
+            with msg_lock:
+                new_msgs = messages[after:]
+                total = len(messages)
+            self.json_response({
+                'msgs': new_msgs,
+                'total': total,
+                'connected': connected
+            })
+
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def json_response(self, data):
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
+
+    def log_message(self, format, *args):
+        pass
+
+# ========== MAIN ==========
+if __name__ == '__main__':
+    PORT = 5000
+    print("=" * 50)
+    print("  MAZE ROBOT WEB CONTROLLER")
+    print("=" * 50)
+    print()
+    print("  1. Connect to MazeRobot WiFi (password: 12345678)")
+    print(f"  2. Open http://localhost:{PORT} in Chrome")
+    print()
+    print("  Keyboard controls: Arrow keys / WASD = move, Space = stop")
+    print()
+    print(f"  Starting server on port {PORT}...")
+    print()
+
+    server = HTTPServer(('', PORT), Handler)
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(10)
-        sock.connect((ESP_IP, ESP_PORT))
-        sock.settimeout(None)
-        print("[Connected to robot!]")
-        print()
-    except Exception as e:
-        print(f"[Failed to connect: {e}]")
-        print("Check that you are on the MazeRobot WiFi network.")
-        sys.exit(1)
-
-    # Start background thread to print incoming messages
-    rx_thread = threading.Thread(target=receive_loop, args=(sock,), daemon=True)
-    rx_thread.start()
-
-    print("-" * 50)
-    print("  COMMANDS:")
-    print("  TRAIN  - Start training (LSRB exploration)")
-    print("  SOLVE  - Run the shortest path")
-    print("  STATUS - Show current state & saved path")
-    print("  STOP   - Stop the robot")
-    print("  RESET  - Clear saved path for new maze")
-    print("  QUIT   - Exit this program")
-    print("-" * 50)
-
-    while True:
-        try:
-            cmd = input("\nCommand > ").strip().upper()
-            if cmd == "QUIT":
-                print("Goodbye!")
-                sock.close()
-                break
-            if cmd:
-                sock.send((cmd + "\r\n").encode())
-                time.sleep(0.1)
-        except (KeyboardInterrupt, EOFError):
-            print("\nGoodbye!")
-            sock.close()
-            break
-
-if __name__ == "__main__":
-    main()
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+        disconnect_robot()
+        server.server_close()
